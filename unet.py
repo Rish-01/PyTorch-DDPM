@@ -1,14 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from torchvision.datasets import ImageFolder
-
-import math
-import numpy as np
-from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 class Upsample(nn.Module):
     def __init__(self, in_channel, out_channel, with_conv=True):
@@ -126,16 +118,25 @@ class UNet(nn.Module):
     embedding_dim: 'ch' from the original paper.
     ch_mult: multiple
     """
-    def __init__(self, timesteps, embedding_dim, out_channel=3, num_res_blocks=2, ch_mult=(1, 2, 4, 8), dropout=0.):
+    def __init__(self, timesteps, embedding_dim, in_channels=3, out_channel=3, num_res_blocks=2, ch_mult=(1, 2, 4, 8), dropout=0.):
         super().__init__()
-        self.device='cuda' if torch.cuda.is_available() else 'cpu'
+        if embedding_dim % 2 != 0:
+            raise ValueError("embedding_dim must be even for sinusoidal time embeddings")
+        if ch_mult[0] != 1:
+            raise ValueError("ch_mult[0] must be 1 so skip channels match the UNet stem")
+        self.timesteps = timesteps
         self.embedding_dim = embedding_dim
+        self.in_channels = in_channels
         self.num_res_blocks = num_res_blocks
         self.ch_mult = ch_mult
         self.dropout = dropout
         self.out_channel = out_channel
         self.num_resolutions = len(ch_mult)
-        self.position_embedding = self.calcPositionalEmbedding(timesteps, self.embedding_dim)
+        self.register_buffer(
+            "position_embedding",
+            self.calcPositionalEmbedding(timesteps, self.embedding_dim),
+            persistent=False,
+        )
     
         
         self.time_mlp = nn.Sequential(
@@ -148,15 +149,14 @@ class UNet(nn.Module):
         self.in_out = list(zip(dims[:-1], dims[1:])) # map in channels to out channels
         mid_dim = dims[-1]
         
-        self.conv = nn.Conv2d(in_channels=self.embedding_dim * self.ch_mult[0], out_channels=out_channel, kernel_size=3, stride=1, padding=0)
-        self.init_conv = nn.Conv2d(in_channels=3, out_channels=self.embedding_dim, kernel_size=3, stride=1, padding=1)
+        self.init_conv = nn.Conv2d(in_channels=in_channels, out_channels=self.embedding_dim, kernel_size=3, stride=1, padding=1)
         
         self.final_resblock = ResBlock(pos_embedding_dim=embedding_dim * 4, 
                                 input_channels=embedding_dim * 2,
                                 output_channels=embedding_dim,
                                 dropout_ratio=self.dropout, 
                                 conv_shortcut=False)
-        self.final_conv = nn.Conv2d(in_channels=embedding_dim, out_channels=3, kernel_size=3, padding=1)
+        self.final_conv = nn.Conv2d(in_channels=embedding_dim, out_channels=out_channel, kernel_size=3, padding=1)
         
         self.downsample_block = self.downsampleBlock()
         self.middle_block = self.middleBlock(mid_dim)
@@ -238,32 +238,39 @@ class UNet(nn.Module):
         positional_encoding = torch.zeros((timesteps, embedding_dim))
         positional_encoding[:, 0::2] = torch.sin(pos * div_term) # sin at even positions
         positional_encoding[:, 1::2] = torch.cos(pos * div_term) # cos at odd positions
-        return positional_encoding.to(self.device)
+        return positional_encoding
+
+    def _time_embedding(self, t, batch_size, device):
+        if not torch.is_tensor(t):
+            t = torch.full((batch_size,), int(t), device=device, dtype=torch.long)
+        else:
+            t = t.to(device=device, dtype=torch.long).view(-1)
+            if t.numel() == 1 and batch_size != 1:
+                t = t.expand(batch_size)
+        return self.time_mlp(self.position_embedding[t])
         
-    def forward(self, x):
+    def forward(self, x, t):
         B, C, H, W = x.shape
-        pos_emb = self.time_mlp(self.position_embedding)
-        assert list(pos_emb.shape) == [B, self.embedding_dim * 4] 
+        pos_emb = self._time_embedding(t, B, x.device)
         hs = []
         x = self.init_conv(x)
         x_initial = x.clone()
         
-        # Downsample blocks
-        for i, (resblock1, resblock2, attention, downsample) in enumerate(self.downsample_block):
+        # Downsample blocks. AttentionBlock already adds a residual.
+        for resblock1, resblock2, attention, downsample in self.downsample_block:
             x = resblock1(x, pos_emb)
             hs.append(x)
             x = resblock2(x, pos_emb)
-            x = attention(x) + x
+            x = attention(x)
             hs.append(x)
             x = downsample(x)
             
-        # Middle Blocks
-        for i, block in enumerate(self.middle_block):
-            # Odd Even position blocks are resblocks
-            if i % 2 == 0:
-                x = block(x, pos_emb)
-            else:
-                x = block(x)
+        # Middle: ResBlock, Attention, ResBlock, Upsample
+        resblock1, attention, resblock2, upsample = self.middle_block
+        x = resblock1(x, pos_emb)
+        x = attention(x)
+        x = resblock2(x, pos_emb)
+        x = upsample(x)
         
         # Upsample Blocks 
         for i, (resblock1, resblock2, attention, upsample) in enumerate(self.upsample_block):
@@ -280,7 +287,9 @@ class UNet(nn.Module):
 
 if __name__=="__main__":
     device='cuda' if torch.cuda.is_available() else 'cpu'
-    x = torch.randn(5, 3, 128,128).to(device)
+    x = torch.randn(2, 3, 32, 32).to(device)
+    t = torch.randint(0, 1000, (2,), device=device)
 
-    unet = UNet(timesteps=5, embedding_dim=128, out_channel=3, num_res_blocks=2, ch_mult=(1, 2, 4, 8), dropout=0).to(device)
-    x = unet(x)
+    unet = UNet(timesteps=1000, embedding_dim=32, out_channel=3, num_res_blocks=2, ch_mult=(1, 2, 4, 8), dropout=0).to(device)
+    y = unet(x, t)
+    print(tuple(y.shape))
